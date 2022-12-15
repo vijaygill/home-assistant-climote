@@ -378,7 +378,7 @@ class ClimoteService:
 
         r = self.s.get(_GET_SCHEDULE_URL
                        + self.config_id)
-        data = r.content
+        data = "".join(r.text.split("\n")[1:])
         xml = ET.fromstring(data)
         self.config = xmljson.parker.data(xml)
 
