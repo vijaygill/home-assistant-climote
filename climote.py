@@ -22,8 +22,8 @@ from homeassistant.const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=60)
-
+MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=5)
+SCAN_INTERVAL = MIN_TIME_BETWEEN_UPDATES
 #: Interval in hours that module will try to refresh data from the climote.
 CONF_REFRESH_INTERVAL = 'refresh_interval'
 
@@ -31,8 +31,8 @@ NOCHANGE = 'nochange'
 DOMAIN = 'climote'
 ICON = "mdi:thermometer"
 
-MAX_TEMP = 35
-MIN_TEMP = 5
+MAX_TEMP = 75
+MIN_TEMP = 0
 
 SUPPORT_FLAGS = SUPPORT_TARGET_TEMPERATURE
 SUPPORT_MODES = [HVAC_MODE_HEAT, HVAC_MODE_OFF]
@@ -63,6 +63,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 
 
     interval = int(config.get(CONF_REFRESH_INTERVAL))
+    
 
     # Add devices
     climote = ClimoteService(username, password, climoteid)
@@ -87,8 +88,12 @@ class Climote(ClimateEntity):
         self._zoneid = zoneid
         self._name = name
         self._force_update = False
-        self.throttled_update = Throttle(timedelta(hours=interval))(self._throttled_update)
+        self.throttled_update = Throttle(timedelta(minutes=interval))(self._throttled_update)
 
+    @property
+    def should_poll(self):
+        return True
+    
     @property
     def supported_features(self):
         """Return the list of supported features."""
@@ -98,6 +103,7 @@ class Climote(ClimateEntity):
     def hvac_mode(self):
         """Return current operation. ie. heat, cool, off."""
         zone = "zone" + str(self._zoneid)
+        _LOGGER.debug(self._climote.data)
         return 'heat' if self._climote.data[zone]["status"] == '5' else 'off'
 
     @property
@@ -164,11 +170,12 @@ class Climote(ClimateEntity):
         if(hvac_mode==HVAC_MODE_HEAT):
             """Turn Heating Boost On."""
             res = self._climote.boost(self._zoneid, 1)
-            self._force_update = True
+            if(res):
+                self._force_update = True
             return res
         if(hvac_mode==HVAC_MODE_OFF):
             """Turn Heating Boost Off."""
-            res = self._climote.boost(self._zoneid, 0)
+            res = self._climote.off(self._zoneid, 0)
             if(res):
                 self._force_update = True
             return res
@@ -182,6 +189,11 @@ class Climote(ClimateEntity):
         if(res):
             self._force_update = True
         return res
+        
+    def update(self):
+        self._climote.updateStatus(self._force_update)
+   
+
 
     async def _throttled_update(self, **kwargs):
         """Get the latest state from the thermostat with a throttle."""
@@ -208,6 +220,7 @@ _SCHEDULE_ELEMENT = '/manager/edit-heating-schedule?heatingScheduleId'
 
 _STATUS_URL = 'https://climote.climote.ie/manager/get-status'
 _STATUS_FORCE_URL = _STATUS_URL + '?force=1'
+_GET_STATUS_FORCE_URL = _STATUS_URL + '?force=0'
 _STATUS_RESPONSE_URL = ('https://climote.climote.ie/manager/'
                         'waiting-get-status-response')
 _BOOST_URL = 'https://climote.climote.ie/manager/boost'
@@ -234,6 +247,7 @@ class ClimoteService:
             self.__login()
             self.__setConfig()
             self.__setZones()
+            self.updateStatus(force=False)
             return True if(self.config is not None) else False
         finally:
             self.__logout()
@@ -247,8 +261,6 @@ class ClimoteService:
                 return False
             self.logged_in = True
             self.token = input['value']
-            _LOGGER.info("Token: %s", self.token)
-            self.__updateStatus(force=True)
             str = r.text
             sched = str.find(_SCHEDULE_ELEMENT)
             if (sched):
@@ -266,14 +278,66 @@ class ClimoteService:
 
     def boost(self, zoneid, time):
         _LOGGER.info('Boosting Zone %s', zoneid)
+        self.set_hvac_mode_on(zoneid)
         return self.__boost(zoneid, time)
+    
+    def off(self, zoneid, time):
+        _LOGGER.info('Turning Off Zone %s', zoneid)
+        self.set_hvac_mode_off(zoneid)
+        return self.__boost(zoneid, time)
+    
+    def set_hvac_mode_on(self, zoneid):
+        zone = "zone" + str(zoneid)
+        self.data[zone]["status"] = '5'
+    
+    def set_hvac_mode_off(self, zoneid):
+        zone = "zone" + str(zoneid)
+        self.data[zone]["status"] = 'null'
+    
+    def set_temp_data(self, zoneid, temp):
+        zone = "zone" + str(zoneid)
+        self.data[zone]["thermostat"] = temp
+
+    def getStatus(self, force):
+        try:
+            self.__login()
+            _LOGGER.info("Beginning Get Status")
+            self.__getStatus(force=True)
+            _LOGGER.info("Ended Get Status")
+        finally:
+            self.__logout()
 
     def updateStatus(self, force):
         try:
             self.__login()
-            self.__updateStatus(force)
+            _LOGGER.info("Beginning Update Status")
+            self.__updateStatus(force=True)
+            _LOGGER.info("Ended Update Status")
         finally:
             self.__logout()
+
+    def __getStatus(self, force):
+        res = None
+        tmp = self.s.headers
+        try:
+            # Make the initial request (force the update)
+            if(force):
+                r = self.s.get(_GET_STATUS_FORCE_URL, data=self.creds)
+            else:
+                r = self.s.get(_STATUS_URL, data=self.creds)
+            if(r.text == '0'):
+                res = False
+            else:
+                self.data = json.loads(r.text)
+                res = True
+        except requests.exceptions.ConnectTimeout:
+            res = False
+        finally:
+            self.s.headers = tmp
+        return res
+        
+        
+
 
     def __updateStatus(self, force):
         def is_done(r):
@@ -314,7 +378,7 @@ class ClimoteService:
 
         r = self.s.get(_GET_SCHEDULE_URL
                        + self.config_id)
-        data = r.content
+        data = "".join(r.text.split("\n")[1:])
         xml = ET.fromstring(data)
         self.config = xmljson.parker.data(xml)
 
@@ -344,6 +408,8 @@ class ClimoteService:
             r = self.s.post(_SET_TEMP_URL, data=data)
             _LOGGER.info('set_temperature: %d', r.status_code)
             res = r.status_code == requests.codes.ok
+            self.set_temp_data(zone, temp=temp)
+
         finally:
             self.__logout()
         return res
